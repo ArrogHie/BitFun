@@ -87,11 +87,13 @@ pub struct AppState {
     /// Cancellation flags for active file transfers (download/upload), keyed by transfer_id.
     pub active_transfers: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
     pub announcement_scheduler: Arc<announcement::AnnouncementScheduler>,
+    pub is_primary_instance: bool,
 }
 
 impl AppState {
     pub async fn new_async(
         token_usage_service: Arc<token_usage::TokenUsageService>,
+        is_primary_instance: bool,
     ) -> BitFunResult<Self> {
         let start_time = std::time::Instant::now();
 
@@ -311,6 +313,7 @@ impl AppState {
             active_searches: Arc::new(Mutex::new(HashMap::new())),
             active_transfers: Arc::new(Mutex::new(HashMap::new())),
             announcement_scheduler,
+            is_primary_instance,
         };
 
         if let Some(workspace_info) = initial_workspace {

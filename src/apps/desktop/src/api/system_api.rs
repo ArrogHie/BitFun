@@ -445,8 +445,9 @@ pub async fn quit_app(app: tauri::AppHandle) -> Result<(), String> {
 pub async fn minimize_to_tray(
     app: tauri::AppHandle,
     startup_trace: State<'_, DesktopStartupTrace>,
+    state: State<'_, AppState>,
 ) -> Result<(), String> {
-    if let Err(error) = crate::tray::setup_tray(&app, &startup_trace) {
+    if let Err(error) = crate::tray::setup_tray(&app, &startup_trace, state.is_primary_instance) {
         log::warn!("Failed to initialize tray before minimizing: {}", error);
     }
     if let Some(window) = app.get_webview_window("main") {
@@ -461,8 +462,9 @@ pub async fn minimize_to_tray(
 pub async fn initialize_tray_after_startup(
     app: tauri::AppHandle,
     startup_trace: State<'_, DesktopStartupTrace>,
+    state: State<'_, AppState>,
 ) -> Result<(), String> {
-    crate::tray::setup_tray(&app, &startup_trace).map_err(|e| e.to_string())
+    crate::tray::setup_tray(&app, &startup_trace, state.is_primary_instance).map_err(|e| e.to_string())
 }
 
 /// Minimal startup-window controls used by the static pre-React splash.
@@ -508,7 +510,7 @@ pub async fn startup_window_control(
                 crate::perform_process_exit_cleanup();
                 app.exit(0);
             } else {
-                if let Err(error) = crate::tray::setup_tray(&app, &startup_trace) {
+                if let Err(error) = crate::tray::setup_tray(&app, &startup_trace, state.is_primary_instance) {
                     log::warn!("Failed to initialize tray before startup close: {}", error);
                 }
                 window.hide().map_err(|error| {

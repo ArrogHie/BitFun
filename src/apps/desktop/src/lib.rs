@@ -6,6 +6,7 @@ pub mod computer_use;
 pub mod crash_diagnostics;
 pub mod logging;
 pub mod macos_menubar;
+pub mod single_instance;
 pub mod startup_trace;
 pub mod theme;
 pub mod tray;
@@ -209,6 +210,7 @@ fn get_startup_native_trace(
 /// Tauri application entry point
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub async fn run() {
+    let is_primary = single_instance::is_primary_instance();
     let startup_started = Instant::now();
     let startup_trace_id = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -320,7 +322,7 @@ pub async fn run() {
     );
 
     let step_started = Instant::now();
-    let app_state = match AppState::new_async(token_usage_service).await {
+    let app_state = match AppState::new_async(token_usage_service, is_primary).await {
         Ok(state) => state,
         Err(e) => {
             log::error!("Failed to initialize AppState: {}", e);

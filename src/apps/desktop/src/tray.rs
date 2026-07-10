@@ -31,6 +31,10 @@ static TRAY_ICON: OnceLock<tauri::tray::TrayIcon> = OnceLock::new();
 static TRAY_SETUP_LOCK: Mutex<()> = Mutex::new(());
 const TRAY_TRACE_CATEGORY: &str = "native_background";
 
+pub(crate) fn should_create_tray(is_primary: bool) -> bool {
+    is_primary && TRAY_ICON.get().is_none()
+}
+
 struct TrayStrings {
     show_app: &'static str,
     quit_app: &'static str,
@@ -171,7 +175,12 @@ async fn tray_toggle_desktop_pet(app: &AppHandle) -> Result<(), String> {
 pub fn setup_tray(
     app: &tauri::AppHandle,
     startup_trace: &DesktopStartupTrace,
+    is_primary: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if !should_create_tray(is_primary) {
+        return Ok(());
+    }
+
     if TRAY_ICON.get().is_some() {
         return Ok(());
     }
@@ -297,5 +306,22 @@ fn toggle_main_window(app: &tauri::AppHandle) {
             let _ = window.set_focus();
             log::info!("Main window shown via tray toggle");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn should_create_tray_for_primary_without_existing_icon() {
+        // Before any tray is created, a primary instance should create one.
+        assert!(should_create_tray(true));
+    }
+
+    #[test]
+    fn should_not_create_tray_for_non_primary() {
+        // A non-primary instance should never create a tray icon.
+        assert!(!should_create_tray(false));
     }
 }
