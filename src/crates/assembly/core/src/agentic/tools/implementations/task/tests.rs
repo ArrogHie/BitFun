@@ -637,6 +637,182 @@ async fn validate_input_accepts_send_input_agent_id_without_subagent_type() {
 }
 
 #[tokio::test]
+async fn validate_input_accepts_instance_id_resume_without_spawn_fields() {
+    let validation = TaskTool::new()
+        .validate_input(
+            &json!({
+                "action": "spawn",
+                "description": "continue subagent",
+                "prompt": "Continue the previous work",
+                "instance_id": "subagent-instance-1"
+            }),
+            None,
+        )
+        .await;
+
+    assert!(validation.result, "{:?}", validation.message);
+    let invocation = TaskTool::parse_invocation(
+        &json!({
+            "action": "spawn",
+            "description": "continue subagent",
+            "prompt": "Continue the previous work",
+            "instance_id": "subagent-instance-1"
+        }),
+        false,
+    )
+    .expect("resume invocation should parse");
+    assert_eq!(
+        invocation.instance_id.as_deref(),
+        Some("subagent-instance-1")
+    );
+    assert!(invocation.subagent_type.is_none());
+}
+
+#[tokio::test]
+async fn validate_input_infers_spawn_without_action_when_instance_id_present() {
+    let validation = TaskTool::new()
+        .validate_input(
+            &json!({
+                "description": "continue subagent",
+                "prompt": "Continue the previous work",
+                "instance_id": "subagent-instance-1"
+            }),
+            None,
+        )
+        .await;
+
+    assert!(validation.result, "{:?}", validation.message);
+}
+
+#[tokio::test]
+async fn validate_input_rejects_instance_id_with_subagent_type() {
+    let validation = TaskTool::new()
+        .validate_input(
+            &json!({
+                "action": "spawn",
+                "description": "continue subagent",
+                "prompt": "Continue the previous work",
+                "instance_id": "subagent-instance-1",
+                "subagent_type": "Explore"
+            }),
+            None,
+        )
+        .await;
+
+    assert!(!validation.result);
+    assert!(validation.message.as_deref().is_some_and(
+        |message| message.contains("subagent_type is not allowed when instance_id is provided")
+    ));
+}
+
+#[tokio::test]
+async fn validate_input_rejects_instance_id_with_fork_context() {
+    let validation = TaskTool::new()
+        .validate_input(
+            &json!({
+                "action": "spawn",
+                "description": "continue subagent",
+                "prompt": "Continue the previous work",
+                "instance_id": "subagent-instance-1",
+                "fork_context": true
+            }),
+            None,
+        )
+        .await;
+
+    assert!(!validation.result);
+    assert!(validation
+        .message
+        .as_deref()
+        .is_some_and(|message| message
+            .contains("fork_context=true is not allowed when instance_id is provided")));
+}
+
+#[tokio::test]
+async fn validate_input_rejects_instance_id_with_model_id() {
+    let validation = TaskTool::new()
+        .validate_input(
+            &json!({
+                "action": "spawn",
+                "description": "continue subagent",
+                "prompt": "Continue the previous work",
+                "instance_id": "subagent-instance-1",
+                "model_id": "fast"
+            }),
+            None,
+        )
+        .await;
+
+    assert!(!validation.result);
+    assert!(validation.message.as_deref().is_some_and(
+        |message| message.contains("model_id is not allowed when instance_id is provided")
+    ));
+}
+
+#[tokio::test]
+async fn validate_input_rejects_instance_id_with_run_in_background() {
+    let validation = TaskTool::new()
+        .validate_input(
+            &json!({
+                "action": "spawn",
+                "description": "continue subagent",
+                "prompt": "Continue the previous work",
+                "instance_id": "subagent-instance-1",
+                "run_in_background": true
+            }),
+            None,
+        )
+        .await;
+
+    assert!(!validation.result);
+    assert!(validation.message.as_deref().is_some_and(|message| message
+        .contains("run_in_background is not supported when instance_id is provided")));
+}
+
+#[tokio::test]
+async fn validate_input_rejects_instance_id_with_send_input() {
+    let validation = TaskTool::new()
+        .validate_input(
+            &json!({
+                "action": "send_input",
+                "description": "continue",
+                "prompt": "Continue the previous analysis",
+                "agent_id": "a1",
+                "instance_id": "subagent-instance-1"
+            }),
+            None,
+        )
+        .await;
+
+    assert!(!validation.result);
+    assert!(validation
+        .message
+        .as_deref()
+        .is_some_and(|message| message.contains("instance_id is not allowed")));
+}
+
+#[tokio::test]
+async fn validate_input_accepts_neutral_placeholders_with_instance_id() {
+    let validation = TaskTool::new()
+        .validate_input(
+            &json!({
+                "action": "spawn",
+                "agent_id": "",
+                "description": "continue subagent",
+                "fork_context": false,
+                "instance_id": "subagent-instance-1",
+                "model_id": "",
+                "prompt": "Continue the previous work",
+                "subagent_type": ""
+            }),
+            None,
+        )
+        .await;
+
+    assert!(validation.result, "{:?}", validation.message);
+}
+
+#[tokio::test]
 async fn validate_input_accepts_send_input_with_model_id() {
     let validation = TaskTool::new()
         .validate_input(

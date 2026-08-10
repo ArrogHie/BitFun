@@ -52,11 +52,15 @@ impl TaskAction {
             .get("fork_context")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        let has_instance_id = value
+            .get("instance_id")
+            .and_then(Value::as_str)
+            .is_some_and(|instance_id| !instance_id.trim().is_empty());
 
-        if !has_agent_id && (has_subagent_type || has_fork_context) {
+        if !has_agent_id && (has_subagent_type || has_fork_context || has_instance_id) {
             return Some(Self::Spawn);
         }
-        if has_agent_id && !has_subagent_type && !has_fork_context {
+        if has_agent_id && !has_subagent_type && !has_fork_context && !has_instance_id {
             return Some(Self::SendInput);
         }
 
@@ -80,6 +84,9 @@ pub(super) struct TaskInvocation {
     pub(super) context_mode: SubagentContextMode,
     pub(super) target_agent_id: Option<String>,
     pub(super) subagent_type: Option<String>,
+    /// Persistent subagent instance ID; when present the invocation resumes an
+    /// existing child session instead of creating a fresh subagent.
+    pub(super) instance_id: Option<String>,
     pub(super) model_id: Option<String>,
     pub(super) inherit_parent_model: bool,
     pub(super) timeout_seconds: Option<u64>,
@@ -123,6 +130,7 @@ impl TaskTool {
                 context_mode: SubagentContextMode::Fresh,
                 target_agent_id: None,
                 subagent_type: Self::string_field(input, "subagent_type", "DeepReview Task calls")?,
+                instance_id: None,
                 model_id,
                 inherit_parent_model,
                 timeout_seconds: Self::optional_timeout_seconds(input)?,
@@ -157,11 +165,35 @@ impl TaskTool {
                         "agent_id is not allowed when action is spawn".to_string(),
                     ));
                 }
+                let instance_id = Self::optional_trimmed_string(input, "instance_id")?;
                 let subagent_type = Self::optional_trimmed_string(input, "subagent_type")?;
+                if instance_id.is_some() {
+                    // Resume mode: instance_id is mutually exclusive with the
+                    // fields that only apply when creating a fresh subagent.
+                    for field in ["subagent_type", "model_id"] {
+                        if Self::has_effective_value(input, field) {
+                            return Err(BitFunError::tool(format!(
+                                "{field} is not allowed when instance_id is provided"
+                            )));
+                        }
+                    }
+                    if Self::context_mode_from_input(input)? == SubagentContextMode::Fork {
+                        return Err(BitFunError::tool(
+                            "fork_context=true is not allowed when instance_id is provided"
+                                .to_string(),
+                        ));
+                    }
+                    if run_in_background {
+                        return Err(BitFunError::tool(
+                            "run_in_background is not supported when instance_id is provided"
+                                .to_string(),
+                        ));
+                    }
+                }
                 let context_mode = Self::context_mode_from_input(input)?;
                 match context_mode {
                     SubagentContextMode::Fresh => {
-                        if subagent_type.is_none() {
+                        if subagent_type.is_none() && instance_id.is_none() {
                             return Err(BitFunError::tool(
                                 "subagent_type is required when action is spawn and fork_context is false or omitted"
                                     .to_string(),
@@ -192,6 +224,7 @@ impl TaskTool {
                     context_mode,
                     target_agent_id: None,
                     subagent_type,
+                    instance_id,
                     model_id,
                     inherit_parent_model,
                     timeout_seconds: None,
@@ -209,6 +242,7 @@ impl TaskTool {
                     &[
                         "fork_context",
                         "subagent_type",
+                        "instance_id",
                         "retry",
                         "auto_retry",
                         "retry_coverage",
@@ -225,6 +259,7 @@ impl TaskTool {
                     context_mode: SubagentContextMode::Fresh,
                     target_agent_id,
                     subagent_type: None,
+                    instance_id: None,
                     model_id,
                     inherit_parent_model,
                     timeout_seconds: None,
@@ -241,6 +276,7 @@ impl TaskTool {
                         "prompt",
                         "fork_context",
                         "subagent_type",
+                        "instance_id",
                         "model_id",
                         "run_in_background",
                         "retry",
@@ -257,6 +293,7 @@ impl TaskTool {
                     context_mode: SubagentContextMode::Fresh,
                     target_agent_id,
                     subagent_type: None,
+                    instance_id: None,
                     model_id: None,
                     inherit_parent_model: false,
                     timeout_seconds: None,

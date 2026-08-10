@@ -31,6 +31,13 @@ impl TaskTool {
                 "description": "Optional model ID for action='spawn' and action='send_input'. Can be 'inherit', 'primary', 'fast', or a configured model ID."
             }),
         );
+        properties.insert(
+            "instance_id".to_string(),
+            json!({
+                "type": "string",
+                "description": "Optional. When provided, resume an existing subagent instance with the given ID. The instance must have been created by a previous Task call that returned an instance_id. When resuming, do not provide subagent_type, fork_context, workspace_path, or model_id — these are inherited from the original instance."
+            }),
+        );
         properties
     }
 
@@ -117,6 +124,9 @@ The two modes are mutually exclusive: do not provide `subagent_type` when `fork_
 - Omit it to use the subagent's configured model, which may differ from your model.
 - Special values: `inherit` explicitly uses the same model as yours; `primary` and `fast` use the user's configured model slots.
 - For a configured model, call ListModels first and use its returned `model_id`.
+
+Resuming a persistent subagent:
+- When a previous Task call returned an `instance_id`, provide that `instance_id` together with `description` and `prompt` to resume the same subagent. The existing child session and its context are reused; do not provide `subagent_type`, `fork_context`, `workspace_path`, or `model_id` when resuming.
 
 Usage notes:
 - Include a short description of what the agent will do for this round (for `spawn` and `send_input`).

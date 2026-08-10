@@ -692,6 +692,22 @@ impl TaskTool {
         let permission_runtime_ceiling =
             Self::derive_parent_permission_runtime_ceiling(context).await?;
         let prepared_prompt = prompt;
+        if let Some(instance_id) = invocation.instance_id.as_deref() {
+            // Resume an existing persistent subagent instance: reuse the child
+            // session instead of creating a fresh one.
+            return Self::run_resume_task(
+                &coordinator,
+                context,
+                instance_id.to_string(),
+                prepared_prompt,
+                tool_call_id,
+                session_id,
+                dialog_turn_id,
+                timeout_seconds,
+                start_time,
+            )
+            .await;
+        }
         if run_in_background {
             return Self::start_background_task(BackgroundTaskStartRequest {
                 coordinator: &coordinator,
@@ -1180,6 +1196,7 @@ impl TaskTool {
                     reason: result.reason.as_deref(),
                     ledger_event_id: result.ledger_event_id(),
                     partial_timeout_suffix: &retry_hint,
+                    instance_id: result.instance_id.as_deref(),
                 },
             );
         if supports_follow_up {
@@ -1195,6 +1212,82 @@ impl TaskTool {
             }
         }
 
+        Ok(vec![ToolResult::Result {
+            data,
+            result_for_assistant: Some(result_for_assistant),
+            image_attachments: None,
+        }])
+    }
+
+    /// Resume a persistent subagent instance on its existing child session.
+    async fn run_resume_task(
+        coordinator: &std::sync::Arc<crate::agentic::coordination::ConversationCoordinator>,
+        context: &ToolUseContext,
+        instance_id: String,
+        prompt: String,
+        tool_call_id: String,
+        session_id: String,
+        dialog_turn_id: String,
+        timeout_seconds: Option<u64>,
+        start_time: Instant,
+    ) -> BitFunResult<Vec<ToolResult>> {
+        let parent_info = SubagentParentInfo {
+            tool_call_id,
+            session_id: session_id.clone(),
+            dialog_turn_id,
+        };
+        debug!(
+            "TaskTool resuming persistent subagent: instance_id={}, parent_session_id={}, timeout_seconds={:?}",
+            instance_id, session_id, timeout_seconds
+        );
+        let result = coordinator
+            .resume_subagent(
+                &instance_id,
+                prompt,
+                parent_info,
+                context.cancellation_token(),
+                timeout_seconds,
+            )
+            .await;
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                warn!(
+                    "TaskTool subagent resume failed: instance_id={}, parent_session_id={}, duration_ms={}, error={}",
+                    instance_id,
+                    session_id,
+                    elapsed_ms_u64(start_time),
+                    error
+                );
+                return Err(error);
+            }
+        };
+        let duration = start_time.elapsed().as_millis();
+        let delegate_target_label = format!("subagent instance '{}'", instance_id);
+        let (mut data, mut result_for_assistant) =
+            bitfun_agent_runtime::subagent_task::subagent_task_completion_result(
+                bitfun_agent_runtime::subagent_task::SubagentTaskCompletionResultInput {
+                    delegate_target_label: &delegate_target_label,
+                    result_text: &result.text,
+                    context_mode: SubagentContextMode::Fresh.as_str(),
+                    duration_ms: duration,
+                    is_partial_timeout: result.is_partial_timeout(),
+                    reason: result.reason.as_deref(),
+                    ledger_event_id: result.ledger_event_id(),
+                    partial_timeout_suffix: "",
+                    instance_id: result.instance_id.as_deref(),
+                },
+            );
+        if let Some(subagent_session_id) = result.session_id() {
+            let agent_id = coordinator
+                .agent_id_for_subagent_session(&session_id, subagent_session_id)
+                .await?;
+            data["agent_id"] = json!(agent_id.clone());
+            result_for_assistant.push_str(&format!(
+                "\n<subagent id=\"{}\">Use this agent_id to continue the same subagent.</subagent>",
+                agent_id
+            ));
+        }
         Ok(vec![ToolResult::Result {
             data,
             result_for_assistant: Some(result_for_assistant),
