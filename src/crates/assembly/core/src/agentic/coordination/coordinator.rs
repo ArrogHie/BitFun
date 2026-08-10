@@ -547,7 +547,8 @@ impl SubagentResult {
     }
 
     pub fn with_instance_id(mut self, instance_id: String) -> Self {
-        self.instance_id = Some(instance_id);
+        // Never overwrite an instance_id that is already present.
+        self.instance_id.get_or_insert(instance_id);
         self
     }
 
@@ -6558,6 +6559,8 @@ Update the persona files and delete BOOTSTRAP.md as soon as bootstrap is complet
             self.background_subagent_outcomes
                 .delete_session_references(related_session_id)
                 .await?;
+            // Any session in the family may own subagent instances.
+            self.cleanup_subagent_instances_for_session(related_session_id);
         }
         self.session_manager
             .discard_transient_session(
@@ -8044,24 +8047,30 @@ Update the persona files and delete BOOTSTRAP.md as soon as bootstrap is complet
         drop(session_config);
         drop(created_by);
         drop(prompt_cache_source_session_id);
-        if let Err(error) = self
-            .session_manager
-            .persist_session_lineage(
-                &session_id,
-                build_subagent_session_relationship(
-                    subagent_parent_info.as_ref(),
-                    &logical_agent_type,
-                    continuation_policy,
-                ),
-            )
-            .await
-        {
-            self.cleanup_prepared_hidden_subagent_session_id_if_unsubmitted(
-                Some(session_id.clone()),
-                prepared_session_created,
-            )
-            .await;
-            return Err(error);
+        // Lineage is only persisted when this execution owns a freshly created
+        // session. Reused sessions (prepared or resumed on an existing child)
+        // already carry their lineage from creation; rewriting it here could
+        // silently reassign the child to a different parent.
+        if prepared_target_session_id.is_none() || prepared_session_created {
+            if let Err(error) = self
+                .session_manager
+                .persist_session_lineage(
+                    &session_id,
+                    build_subagent_session_relationship(
+                        subagent_parent_info.as_ref(),
+                        &logical_agent_type,
+                        continuation_policy,
+                    ),
+                )
+                .await
+            {
+                self.cleanup_prepared_hidden_subagent_session_id_if_unsubmitted(
+                    Some(session_id.clone()),
+                    prepared_session_created,
+                )
+                .await;
+                return Err(error);
+            }
         }
 
         // Register timeout handle so it can be adjusted at runtime.
@@ -10003,10 +10012,34 @@ Update the persona files and delete BOOTSTRAP.md as soon as bootstrap is complet
         cancel_token: Option<&CancellationToken>,
         timeout_seconds: Option<u64>,
     ) -> BitFunResult<SubagentResult> {
-        debug!("execute_subagent create path: no instance_id provided");
+        debug!("Subagent task executing without a persistent instance_id (fresh create path)");
         let parent_session_id = request.subagent_parent_info.session_id.clone();
         let request = self.prepare_subagent_execution_request(request).await?;
+        let child_session_id = request
+            .target_session_id()
+            .ok_or_else(|| {
+                BitFunError::Validation(
+                    "prepared hidden subagent request is missing target_session_id".to_string(),
+                )
+            })?
+            .to_string();
         let agent_type = request.agent_type.clone();
+
+        // Register the persistent instance before execution. The instance stays
+        // Running for the whole task so a concurrent resume attempt is rejected,
+        // then returns to Idle so the child session can be resumed later.
+        let instance_id = SubagentInstance::generate_instance_id();
+        let instance = SubagentInstance::new(
+            instance_id.clone(),
+            parent_session_id.clone(),
+            child_session_id.clone(),
+            agent_type.clone(),
+        );
+        info!(
+            "Subagent instance created: instance_id={}, parent_session_id={}, child_session_id={}, agent_type={}",
+            instance_id, parent_session_id, child_session_id, agent_type
+        );
+        self.subagent_instances.register(instance);
         let result = if let Some(scheduler) = get_global_scheduler() {
             let submit_result = match scheduler
                 .submit_hidden_subagent(request.clone(), timeout_seconds)
@@ -10016,6 +10049,8 @@ Update the persona files and delete BOOTSTRAP.md as soon as bootstrap is complet
                 Err(error) => {
                     self.cleanup_prepared_hidden_subagent_session_if_unsubmitted(&request)
                         .await;
+                    self.subagent_instances
+                        .destroy(&instance_id, "scheduler submit failed");
                     return Err(BitFunError::tool(error));
                 }
             };
@@ -10041,32 +10076,24 @@ Update the persona files and delete BOOTSTRAP.md as soon as bootstrap is complet
         } else {
             self.execute_prepared_hidden_subagent(request, cancel_token, timeout_seconds)
                 .await
-        }?;
+        };
 
-        // Phase 2: register a persistent instance so the child session can be
-        // resumed later through resume_subagent. The child session ID comes
-        // from the executed result; only successful or partial-timeout results
-        // carry one.
-        let mut result = result;
-        if let Some(child_session_id) = result.session_id().map(str::to_string) {
-            let instance_id = SubagentInstance::generate_instance_id();
-            let instance = SubagentInstance::new(
-                instance_id.clone(),
-                parent_session_id.clone(),
-                child_session_id,
-                agent_type.clone(),
-            );
-            info!(
-                "Subagent instance created: instance_id={}, parent_session_id={}, child_session_id={}, agent_type={}",
-                instance_id,
-                parent_session_id,
-                instance.child_session_id,
-                instance.agent_type
-            );
-            self.subagent_instances.register(instance);
-            result = result.with_instance_id(instance_id);
-        }
-        Ok(result)
+        // Whether the task succeeded or failed, the child session is preserved
+        // and the instance returns to Idle for a later resume.
+        self.subagent_instances
+            .set_idle(&instance_id)
+            .unwrap_or_else(|error| {
+                warn!(
+                    "Failed to set subagent instance to Idle after task completion: instance_id={}, error={}",
+                    instance_id, error
+                );
+            });
+        debug!(
+            "Subagent instance set to Idle after task completion: instance_id={}",
+            instance_id
+        );
+
+        result.map(|result| result.with_instance_id(instance_id))
     }
 
     /// Resume a persistent subagent instance.
@@ -10134,15 +10161,17 @@ Update the persona files and delete BOOTSTRAP.md as soon as bootstrap is complet
             "Subagent instance set to Idle after task completion: instance_id={}",
             instance_id
         );
-        result
+        result.map(|result| result.with_instance_id(instance_id.to_string()))
     }
 
     /// Execute a dialog turn on an existing child session (resume path).
     ///
     /// Unlike `execute_hidden_subagent_internal`'s fresh-session path, no
-    /// session is created, no lineage is (re)established, and no prompt cache
-    /// is cloned. The request targets the persisted child session directly and
-    /// reuses the full timeout/cancel/cleanup machinery.
+    /// session is created and no prompt cache is cloned. The request targets
+    /// the persisted child session directly and reuses the full
+    /// timeout/cancel/cleanup machinery. Reuse validation (restore from
+    /// storage, fresh-only policy, parent ownership, error state) goes through
+    /// `ensure_subagent_session_loaded_for_reuse`.
     async fn execute_resume_on_existing_session(
         &self,
         existing_session_id: String,
@@ -10159,20 +10188,11 @@ Update the persona files and delete BOOTSTRAP.md as soon as bootstrap is complet
             ));
         }
         let session = self
-            .session_manager
-            .get_session(&existing_session_id)
-            .ok_or_else(|| {
-                BitFunError::NotFound(format!(
-                    "Subagent session not found: {}",
-                    existing_session_id
-                ))
-            })?;
-        if session.kind != SessionKind::Subagent {
-            return Err(BitFunError::Validation(format!(
-                "Subagent execution target must be a subagent session: {}",
-                existing_session_id
-            )));
-        }
+            .ensure_subagent_session_loaded_for_reuse(
+                &existing_session_id,
+                &subagent_parent_info.session_id,
+            )
+            .await?;
         let transient = self
             .session_manager
             .is_transient_session(&existing_session_id);
@@ -15628,6 +15648,14 @@ mod tests {
             with_instance.instance_id.as_deref(),
             Some("subagent-instance-1")
         );
+
+        // An already-present instance_id must never be overwritten.
+        let rebind = with_instance.with_instance_id("subagent-instance-2".to_string());
+        assert_eq!(
+            rebind.instance_id.as_deref(),
+            Some("subagent-instance-1"),
+            "with_instance_id must not overwrite an existing instance_id"
+        );
     }
 
     #[tokio::test]
@@ -15798,6 +15826,333 @@ mod tests {
             .get_subagent_instance(&id_c)
             .expect("other parent's instance survives");
         assert_eq!(remaining.parent_session_id, "parent-b");
+    }
+
+    #[tokio::test]
+    async fn execute_subagent_failure_before_registration_leaves_registry_empty() {
+        let (coordinator, _) = test_coordinator();
+        let request = SubagentExecutionRequest {
+            task_description: "Inspect the repo".to_string(),
+            context_mode: SubagentContextMode::Fresh,
+            target_session_id: None,
+            subagent_type: Some("Explore".to_string()),
+            logical_subagent_type: None,
+            continuation_policy: SessionContinuationPolicy::Reusable,
+            model_binding_policy: SessionModelBindingPolicy::Mutable,
+            workspace_path: Some("unused".to_string()),
+            model_id: Some("primary".to_string()),
+            inherit_parent_model: false,
+            subagent_parent_info: SubagentParentInfo {
+                tool_call_id: "task-tool".to_string(),
+                session_id: "missing-parent-session".to_string(),
+                dialog_turn_id: "parent-turn".to_string(),
+            },
+            context: HashMap::new(),
+            permission_runtime_ceiling: PermissionRuntimeCeiling::default(),
+            delegation_policy: DelegationPolicy::top_level().spawn_child(),
+            external_generation_lease: None,
+        };
+        let error = coordinator
+            .execute_subagent(request, None, None)
+            .await
+            .expect_err("missing parent session must fail before any execution");
+        assert!(
+            error.to_string().contains("not found"),
+            "unexpected error: {}",
+            error
+        );
+        assert_eq!(
+            coordinator.subagent_instances.active_count(),
+            0,
+            "no instance may be registered when execution never starts"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_subagent_registers_idle_instance_when_execution_cancelled_before_start() {
+        let (coordinator, session_manager) = test_coordinator();
+        let workspace_path = std::env::temp_dir().join(format!(
+            "bitfun-subagent-instance-create-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace_path).expect("workspace dir should exist");
+        struct TempWorkspaceGuard(std::path::PathBuf);
+        impl Drop for TempWorkspaceGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _workspace_guard = TempWorkspaceGuard(workspace_path.clone());
+        let workspace = workspace_path.to_string_lossy().into_owned();
+        let parent_session = session_manager
+            .create_session(
+                "Parent".to_string(),
+                "agentic".to_string(),
+                SessionConfig {
+                    model_id: Some("primary".to_string()),
+                    workspace_path: Some(workspace.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("parent session should be created");
+        let cancel_token = tokio_util::sync::CancellationToken::new();
+        cancel_token.cancel();
+
+        let result = coordinator
+            .execute_subagent(
+                SubagentExecutionRequest {
+                    task_description: "Inspect the repo".to_string(),
+                    context_mode: SubagentContextMode::Fresh,
+                    target_session_id: None,
+                    subagent_type: Some("Explore".to_string()),
+                    logical_subagent_type: None,
+                    continuation_policy: SessionContinuationPolicy::Reusable,
+                    model_binding_policy: SessionModelBindingPolicy::Mutable,
+                    workspace_path: Some(workspace),
+                    model_id: Some("primary".to_string()),
+                    inherit_parent_model: false,
+                    subagent_parent_info: SubagentParentInfo {
+                        tool_call_id: "task-tool".to_string(),
+                        session_id: parent_session.session_id.clone(),
+                        dialog_turn_id: "parent-turn".to_string(),
+                    },
+                    context: HashMap::new(),
+                    permission_runtime_ceiling: PermissionRuntimeCeiling::default(),
+                    delegation_policy: DelegationPolicy::top_level().spawn_child(),
+                    external_generation_lease: None,
+                },
+                Some(&cancel_token),
+                None,
+            )
+            .await;
+
+        assert!(result.is_err(), "pre-cancelled execution must fail");
+        let instance_ids = coordinator
+            .subagent_instances
+            .list_for_parent(&parent_session.session_id);
+        assert_eq!(
+            instance_ids.len(),
+            1,
+            "the registered instance must survive a failed execution"
+        );
+        let instance = coordinator
+            .get_subagent_instance(&instance_ids[0])
+            .expect("registered instance should be readable");
+        assert_eq!(
+            instance.status,
+            SubagentInstanceStatus::Idle,
+            "instance must return to Idle after the task ends"
+        );
+        assert!(instance.can_resume());
+    }
+
+    #[tokio::test]
+    async fn resume_subagent_rejects_session_not_owned_by_parent() {
+        let (coordinator, session_manager) = test_coordinator();
+        let workspace_path = std::env::temp_dir().join(format!(
+            "bitfun-subagent-resume-ownership-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace_path).expect("workspace dir should exist");
+        struct TempWorkspaceGuard(std::path::PathBuf);
+        impl Drop for TempWorkspaceGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _workspace_guard = TempWorkspaceGuard(workspace_path.clone());
+        let workspace = workspace_path.to_string_lossy().into_owned();
+        let owner_parent = session_manager
+            .create_session(
+                "Owner".to_string(),
+                "agentic".to_string(),
+                SessionConfig {
+                    model_id: Some("primary".to_string()),
+                    workspace_path: Some(workspace.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("owner parent session should be created");
+        let child_session = session_manager
+            .create_session_with_id_and_details(
+                None,
+                "Child".to_string(),
+                "Explore".to_string(),
+                SessionConfig {
+                    model_id: Some("primary".to_string()),
+                    workspace_path: Some(workspace),
+                    ..Default::default()
+                },
+                Some(format!("session-{}", owner_parent.session_id)),
+                SessionKind::Subagent,
+            )
+            .await
+            .expect("subagent child session should be created");
+
+        // The instance is owned by `owner_parent`; resuming it from a different
+        // parent must fail the lineage/creator ownership check.
+        let instance = SubagentInstance::new(
+            SubagentInstance::generate_instance_id(),
+            owner_parent.session_id.clone(),
+            child_session.session_id.clone(),
+            "Explore".to_string(),
+        );
+        let instance_id = instance.instance_id.clone();
+        coordinator.subagent_instances.register(instance);
+        coordinator
+            .subagent_instances
+            .set_idle(&instance_id)
+            .expect("instance should become Idle");
+
+        let error = coordinator
+            .resume_subagent(
+                &instance_id,
+                "continue".to_string(),
+                SubagentParentInfo {
+                    tool_call_id: "tool-1".to_string(),
+                    session_id: "intruder-parent".to_string(),
+                    dialog_turn_id: "turn-1".to_string(),
+                },
+                None,
+                None,
+            )
+            .await
+            .expect_err("resume from a different parent must be rejected");
+        assert!(
+            error.to_string().contains("not created by parent"),
+            "unexpected error: {}",
+            error
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_subagent_rejects_non_subagent_session() {
+        let (coordinator, session_manager) = test_coordinator();
+        let workspace_path = std::env::temp_dir().join(format!(
+            "bitfun-subagent-resume-kind-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace_path).expect("workspace dir should exist");
+        struct TempWorkspaceGuard(std::path::PathBuf);
+        impl Drop for TempWorkspaceGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _workspace_guard = TempWorkspaceGuard(workspace_path.clone());
+        let workspace = workspace_path.to_string_lossy().into_owned();
+        let parent_session = session_manager
+            .create_session(
+                "Parent".to_string(),
+                "agentic".to_string(),
+                SessionConfig {
+                    model_id: Some("primary".to_string()),
+                    workspace_path: Some(workspace.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("parent session should be created");
+        let standard_session = session_manager
+            .create_session(
+                "Standard child".to_string(),
+                "agentic".to_string(),
+                SessionConfig {
+                    model_id: Some("primary".to_string()),
+                    workspace_path: Some(workspace),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("standard session should be created");
+
+        // The instance points at a session that is not a subagent session.
+        let instance = SubagentInstance::new(
+            SubagentInstance::generate_instance_id(),
+            parent_session.session_id.clone(),
+            standard_session.session_id.clone(),
+            "agentic".to_string(),
+        );
+        let instance_id = instance.instance_id.clone();
+        coordinator.subagent_instances.register(instance);
+        coordinator
+            .subagent_instances
+            .set_idle(&instance_id)
+            .expect("instance should become Idle");
+
+        let error = coordinator
+            .resume_subagent(
+                &instance_id,
+                "continue".to_string(),
+                SubagentParentInfo {
+                    tool_call_id: "tool-1".to_string(),
+                    session_id: parent_session.session_id.clone(),
+                    dialog_turn_id: "turn-1".to_string(),
+                },
+                None,
+                None,
+            )
+            .await
+            .expect_err("resume onto a non-subagent session must be rejected");
+        assert!(
+            error.to_string().contains("must be a subagent session"),
+            "unexpected error: {}",
+            error
+        );
+    }
+
+    #[tokio::test]
+    async fn discard_transient_session_cleans_up_subagent_instances() {
+        let (coordinator, session_manager) = test_coordinator();
+        let workspace_path = std::env::temp_dir().join(format!(
+            "bitfun-subagent-transient-cleanup-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace_path).expect("workspace dir should exist");
+        struct TempWorkspaceGuard(std::path::PathBuf);
+        impl Drop for TempWorkspaceGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _workspace_guard = TempWorkspaceGuard(workspace_path.clone());
+        let workspace = workspace_path.to_string_lossy().into_owned();
+        let transient_parent = session_manager
+            .create_transient_session_with_id_and_details(
+                None,
+                "Transient parent".to_string(),
+                "agentic".to_string(),
+                SessionConfig {
+                    model_id: Some("primary".to_string()),
+                    workspace_path: Some(workspace.clone()),
+                    ..Default::default()
+                },
+                None,
+                SessionKind::Standard,
+            )
+            .await
+            .expect("transient parent should be created");
+
+        let instance = SubagentInstance::new(
+            SubagentInstance::generate_instance_id(),
+            transient_parent.session_id.clone(),
+            "child-session".to_string(),
+            "Explore".to_string(),
+        );
+        let instance_id = instance.instance_id.clone();
+        coordinator.subagent_instances.register(instance);
+
+        coordinator
+            .discard_transient_session(&workspace_path, None, None, &transient_parent.session_id)
+            .await
+            .expect("transient session discard should succeed");
+
+        assert!(
+            coordinator.get_subagent_instance(&instance_id).is_none(),
+            "discarding a transient parent must destroy its subagent instances"
+        );
     }
 
     #[tokio::test]

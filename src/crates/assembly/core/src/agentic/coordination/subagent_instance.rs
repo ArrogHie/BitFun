@@ -188,7 +188,6 @@ impl SubagentInstanceRegistry {
 
     /// Destroy a single instance. Logs at info level. Hard delete: the entry
     /// is removed from the registry (see `SubagentInstanceStatus`).
-    #[allow(dead_code, reason = "consumed by later-phase per-instance cleanup")]
     pub(crate) fn destroy(&self, instance_id: &str, reason: &str) {
         if let Some((_, instance)) = self.instances.remove(instance_id) {
             info!(
@@ -198,8 +197,9 @@ impl SubagentInstanceRegistry {
         }
     }
 
-    /// Destroy all instances for a given parent session. Logs at info level.
-    /// Returns the count of destroyed instances.
+    /// Destroy all instances for a given parent session. Logs at debug level
+    /// (the caller gates user-visible cleanup logs). Returns the count of
+    /// destroyed instances.
     pub(crate) fn destroy_all_for_parent(&self, parent_session_id: &str) -> usize {
         let to_remove: Vec<String> = self
             .instances
@@ -208,7 +208,7 @@ impl SubagentInstanceRegistry {
             .map(|entry| entry.key().clone())
             .collect();
         let count = to_remove.len();
-        info!(
+        debug!(
             "Destroying all subagent instances for parent session: parent_session_id={}, count={}",
             parent_session_id, count
         );
