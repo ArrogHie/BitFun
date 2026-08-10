@@ -12,6 +12,9 @@ pub struct SubagentTaskCompletionResultInput<'a> {
     pub reason: Option<&'a str>,
     pub ledger_event_id: Option<&'a str>,
     pub partial_timeout_suffix: &'a str,
+    /// Persistent subagent instance ID, present when the executed subagent
+    /// was registered as a resumable instance.
+    pub instance_id: Option<&'a str>,
 }
 
 pub fn subagent_task_completion_result(
@@ -38,6 +41,10 @@ pub fn subagent_task_completion_result(
         "context_mode": input.context_mode,
         "status": status
     });
+
+    if let Some(instance_id) = input.instance_id {
+        data["instance_id"] = json!(instance_id);
+    }
 
     if input.is_partial_timeout {
         data["partial_output"] = json!(input.result_text);

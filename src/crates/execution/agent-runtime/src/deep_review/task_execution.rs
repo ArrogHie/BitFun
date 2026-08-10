@@ -420,6 +420,9 @@ pub struct DeepReviewTaskCompletionResultInput<'a> {
     pub reason: Option<&'a str>,
     pub ledger_event_id: Option<&'a str>,
     pub retry_hint: &'a str,
+    /// Persistent subagent instance ID, present when the executed subagent
+    /// was registered as a resumable instance.
+    pub instance_id: Option<&'a str>,
 }
 
 pub fn deep_review_task_completion_result(
@@ -435,6 +438,7 @@ pub fn deep_review_task_completion_result(
             reason: input.reason,
             ledger_event_id: input.ledger_event_id,
             partial_timeout_suffix: input.retry_hint,
+            instance_id: input.instance_id,
         },
     )
 }
@@ -2112,12 +2116,14 @@ mod tests {
                 reason: None,
                 ledger_event_id: None,
                 retry_hint: "",
+                instance_id: None,
             });
 
         assert_eq!(data["duration"], json!(42));
         assert_eq!(data["context_mode"], "fresh");
         assert_eq!(data["status"], "completed");
         assert!(data.get("partial_output").is_none());
+        assert!(data.get("instance_id").is_none());
         assert_eq!(
             assistant_message,
             "ReviewSecurity completed successfully with result:\n<result>\nNo issues found\n</result>"
@@ -2136,12 +2142,14 @@ mod tests {
                 reason: Some("timeout"),
                 ledger_event_id: Some("event-1"),
                 retry_hint: "\n\n<retry_guidance>retry</retry_guidance>",
+                instance_id: Some("subagent-instance-1"),
             });
 
         assert_eq!(data["status"], "partial_timeout");
         assert_eq!(data["partial_output"], "Partial findings");
         assert_eq!(data["reason"], "timeout");
         assert_eq!(data["ledger_event_id"], "event-1");
+        assert_eq!(data["instance_id"], "subagent-instance-1");
         assert_eq!(
             assistant_message,
             "ReviewPerformance timed out with partial result:\n<partial_result status=\"partial_timeout\">\nPartial findings\n</partial_result>\n\n<retry_guidance>retry</retry_guidance>"
