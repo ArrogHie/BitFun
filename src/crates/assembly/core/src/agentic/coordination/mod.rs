@@ -7,10 +7,6 @@ mod coordination_store;
 pub mod coordinator;
 pub mod scheduler;
 pub mod state_manager;
-// Phase 1 of persistent subagents: types are not yet wired into production
-// call paths (Phase 2 registers the registry in the Coordinator). The expect
-// fires a reminder once Phase 2 starts using the module.
-#[expect(dead_code, reason = "Phase 2 wires the registry into the Coordinator")]
 mod subagent_instance;
 pub mod turn_outcome;
 mod turn_settlement;
@@ -25,11 +21,12 @@ pub(crate) use background_outcomes::{
     BackgroundSubagentWaitResult,
 };
 
-// Re-exported for Phase 2 wiring into the Coordinator; currently unused.
-#[expect(unused_imports)]
-pub(crate) use subagent_instance::{
-    SubagentInstance, SubagentInstanceRegistry, SubagentInstanceStatus,
-};
+// Wired into the Coordinator as the persistent subagent instance registry.
+pub(crate) use subagent_instance::{SubagentInstance, SubagentInstanceRegistry};
+// Referenced by coordinator tests; the lib call path only reads the status
+// through the registry API.
+#[allow(unused_imports)]
+pub(crate) use subagent_instance::SubagentInstanceStatus;
 
 pub use coordinator::get_global_coordinator;
 pub use scheduler::get_global_scheduler;

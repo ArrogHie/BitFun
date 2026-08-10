@@ -11,6 +11,7 @@ use super::{
     turn_outcome::TurnOutcome,
     turn_settlement::TurnSettlementTracker,
     BackgroundSubagentOutcomeStore, BackgroundSubagentWaitMode, BackgroundSubagentWaitResult,
+    SubagentInstance, SubagentInstanceRegistry,
 };
 use crate::agentic::agents::{get_agent_registry, ExternalSubagentModelBinding};
 use crate::agentic::context_profile::ContextProfilePolicy;
@@ -444,6 +445,9 @@ pub struct SubagentResult {
     pub reason: Option<String>,
     pub ledger_event_id: Option<String>,
     pub session_id: Option<String>,
+    /// Persistent subagent instance ID for resume.
+    /// None for non-persistent (legacy) subagent calls.
+    pub instance_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -517,6 +521,7 @@ impl SubagentResult {
             reason: None,
             ledger_event_id: None,
             session_id: None,
+            instance_id: None,
         }
     }
 
@@ -527,6 +532,7 @@ impl SubagentResult {
             reason: Some(reason),
             ledger_event_id: None,
             session_id: None,
+            instance_id: None,
         }
     }
 
@@ -537,6 +543,11 @@ impl SubagentResult {
 
     fn with_ledger_event_id(mut self, event_id: String) -> Self {
         self.ledger_event_id = Some(event_id);
+        self
+    }
+
+    pub fn with_instance_id(mut self, instance_id: String) -> Self {
+        self.instance_id = Some(instance_id);
         self
     }
 
@@ -1112,6 +1123,9 @@ pub struct ConversationCoordinator {
     /// before the normal cancellation path may expose the Session as idle.
     manual_compaction_controls: Arc<DashMap<String, Arc<ManualCompactionCommitGate>>>,
     thread_goal_runtime: Arc<ThreadGoalRuntime>,
+    /// Persistent subagent instances keyed by instance_id, scoped to this
+    /// Coordinator lifetime.
+    subagent_instances: Arc<SubagentInstanceRegistry>,
     terminal_port: OnceLock<Arc<dyn TerminalPort>>,
     remote_exec_port: OnceLock<Arc<dyn RemoteExecPort>>,
 }
@@ -2086,6 +2100,7 @@ Update the persona files and delete BOOTSTRAP.md as soon as bootstrap is complet
             turn_settlements: Arc::new(TurnSettlementTracker::default()),
             manual_compaction_controls: Arc::new(DashMap::new()),
             thread_goal_runtime: Arc::new(ThreadGoalRuntime::new()),
+            subagent_instances: Arc::new(SubagentInstanceRegistry::new()),
             terminal_port: OnceLock::new(),
             remote_exec_port: OnceLock::new(),
         }
@@ -3721,6 +3736,7 @@ Update the persona files and delete BOOTSTRAP.md as soon as bootstrap is complet
                                     reason: result.reason.as_deref(),
                                     ledger_event_id: result.ledger_event_id(),
                                     partial_timeout_suffix: "",
+                                    instance_id: result.instance_id.as_deref(),
                                 },
                             );
                         coordinator
@@ -6510,6 +6526,7 @@ Update the persona files and delete BOOTSTRAP.md as soon as bootstrap is complet
         self.background_subagent_outcomes
             .delete_session_references(session_id)
             .await?;
+        self.cleanup_subagent_instances_for_session(session_id);
         self.emit_event(AgenticEvent::SessionDeleted {
             session_id: session_id.to_string(),
         })
@@ -9986,43 +10003,208 @@ Update the persona files and delete BOOTSTRAP.md as soon as bootstrap is complet
         cancel_token: Option<&CancellationToken>,
         timeout_seconds: Option<u64>,
     ) -> BitFunResult<SubagentResult> {
+        debug!("execute_subagent create path: no instance_id provided");
+        let parent_session_id = request.subagent_parent_info.session_id.clone();
         let request = self.prepare_subagent_execution_request(request).await?;
-        let Some(scheduler) = get_global_scheduler() else {
-            return self
-                .execute_prepared_hidden_subagent(request, cancel_token, timeout_seconds)
-                .await;
-        };
-        let submit_result = match scheduler
-            .submit_hidden_subagent(request.clone(), timeout_seconds)
-            .await
-        {
-            Ok(submit_result) => submit_result,
-            Err(error) => {
-                self.cleanup_prepared_hidden_subagent_session_if_unsubmitted(&request)
-                    .await;
-                return Err(BitFunError::tool(error));
-            }
-        };
-        let receiver = submit_result.receiver;
-        let result = if let Some(token) = cancel_token {
-            let received = Self::await_hidden_subagent_receiver(receiver);
-            tokio::pin!(received);
-            tokio::select! {
-                _ = token.cancelled() => {
-                    scheduler
-                        .request_hidden_subagent_cancellation(&submit_result.cancel_handle)
+        let agent_type = request.agent_type.clone();
+        let result = if let Some(scheduler) = get_global_scheduler() {
+            let submit_result = match scheduler
+                .submit_hidden_subagent(request.clone(), timeout_seconds)
+                .await
+            {
+                Ok(submit_result) => submit_result,
+                Err(error) => {
+                    self.cleanup_prepared_hidden_subagent_session_if_unsubmitted(&request)
                         .await;
-                    Self::await_hidden_subagent_cancellation(
-                        &mut received,
-                        SUBAGENT_TIMEOUT_GRACE_PERIOD,
-                    ).await
-                },
-                result = &mut received => result,
+                    return Err(BitFunError::tool(error));
+                }
+            };
+            let receiver = submit_result.receiver;
+            if let Some(token) = cancel_token {
+                let received = Self::await_hidden_subagent_receiver(receiver);
+                tokio::pin!(received);
+                tokio::select! {
+                    _ = token.cancelled() => {
+                        scheduler
+                            .request_hidden_subagent_cancellation(&submit_result.cancel_handle)
+                            .await;
+                        Self::await_hidden_subagent_cancellation(
+                            &mut received,
+                            SUBAGENT_TIMEOUT_GRACE_PERIOD,
+                        ).await
+                    },
+                    result = &mut received => result,
+                }
+            } else {
+                Self::await_hidden_subagent_receiver(receiver).await
             }
         } else {
-            Self::await_hidden_subagent_receiver(receiver).await
-        };
+            self.execute_prepared_hidden_subagent(request, cancel_token, timeout_seconds)
+                .await
+        }?;
+
+        // Phase 2: register a persistent instance so the child session can be
+        // resumed later through resume_subagent. The child session ID comes
+        // from the executed result; only successful or partial-timeout results
+        // carry one.
+        let mut result = result;
+        if let Some(child_session_id) = result.session_id().map(str::to_string) {
+            let instance_id = SubagentInstance::generate_instance_id();
+            let instance = SubagentInstance::new(
+                instance_id.clone(),
+                parent_session_id.clone(),
+                child_session_id,
+                agent_type.clone(),
+            );
+            info!(
+                "Subagent instance created: instance_id={}, parent_session_id={}, child_session_id={}, agent_type={}",
+                instance_id,
+                parent_session_id,
+                instance.child_session_id,
+                instance.agent_type
+            );
+            self.subagent_instances.register(instance);
+            result = result.with_instance_id(instance_id);
+        }
+        Ok(result)
+    }
+
+    /// Resume a persistent subagent instance.
+    ///
+    /// Uses the existing child session, starts a new dialog turn on it,
+    /// and executes the agent loop with the preserved context.
+    pub(crate) async fn resume_subagent(
+        &self,
+        instance_id: &str,
+        task_description: String,
+        subagent_parent_info: SubagentParentInfo,
+        cancel_token: Option<&CancellationToken>,
+        timeout_seconds: Option<u64>,
+    ) -> BitFunResult<SubagentResult> {
+        debug!("execute_subagent resume path: instance_id={}", instance_id);
+        let instance = self.get_subagent_instance(instance_id).ok_or_else(|| {
+            warn!(
+                "Subagent instance not found for resume: instance_id={}",
+                instance_id
+            );
+            BitFunError::tool(format!("Subagent instance not found: {}", instance_id))
+        })?;
+        if !instance.can_resume() {
+            warn!(
+                "Subagent instance not Idle, cannot resume: instance_id={}, current_status={:?}",
+                instance_id, instance.status
+            );
+            return Err(BitFunError::tool(format!(
+                "Subagent instance {} is not idle (current status: {:?}), cannot resume",
+                instance_id, instance.status
+            )));
+        }
+        self.subagent_instances
+            .set_running(instance_id)
+            .map_err(BitFunError::tool)?;
+        info!(
+            "Subagent instance resumed: instance_id={}, child_session_id={}, agent_type={}",
+            instance_id, instance.child_session_id, instance.agent_type
+        );
+        debug!(
+            "Resuming subagent on existing session: instance_id={}, child_session_id={}",
+            instance_id, instance.child_session_id
+        );
+        let result = self
+            .execute_resume_on_existing_session(
+                instance.child_session_id.clone(),
+                instance.agent_type.clone(),
+                task_description,
+                subagent_parent_info,
+                cancel_token,
+                timeout_seconds,
+            )
+            .await;
+        // Whether the resumed turn succeeded or failed, the session is
+        // preserved and the instance goes back to Idle for a later resume.
+        self.subagent_instances
+            .set_idle(instance_id)
+            .unwrap_or_else(|error| {
+                warn!(
+                    "Failed to set subagent instance to Idle after resume: instance_id={}, error={}",
+                    instance_id, error
+                );
+            });
+        debug!(
+            "Subagent instance set to Idle after task completion: instance_id={}",
+            instance_id
+        );
         result
+    }
+
+    /// Execute a dialog turn on an existing child session (resume path).
+    ///
+    /// Unlike `execute_hidden_subagent_internal`'s fresh-session path, no
+    /// session is created, no lineage is (re)established, and no prompt cache
+    /// is cloned. The request targets the persisted child session directly and
+    /// reuses the full timeout/cancel/cleanup machinery.
+    async fn execute_resume_on_existing_session(
+        &self,
+        existing_session_id: String,
+        agent_type: String,
+        task_description: String,
+        subagent_parent_info: SubagentParentInfo,
+        cancel_token: Option<&CancellationToken>,
+        timeout_seconds: Option<u64>,
+    ) -> BitFunResult<SubagentResult> {
+        let task_description = task_description.trim().to_string();
+        if task_description.is_empty() {
+            return Err(BitFunError::Validation(
+                "task_description is required when resuming a subagent session".to_string(),
+            ));
+        }
+        let session = self
+            .session_manager
+            .get_session(&existing_session_id)
+            .ok_or_else(|| {
+                BitFunError::NotFound(format!(
+                    "Subagent session not found: {}",
+                    existing_session_id
+                ))
+            })?;
+        if session.kind != SessionKind::Subagent {
+            return Err(BitFunError::Validation(format!(
+                "Subagent execution target must be a subagent session: {}",
+                existing_session_id
+            )));
+        }
+        let transient = self
+            .session_manager
+            .is_transient_session(&existing_session_id);
+        let delegation_policy = DelegationPolicy::default().spawn_child();
+        let hidden_request = HiddenSubagentExecutionRequest {
+            target_session_id: Some(existing_session_id.clone()),
+            dialog_turn_id: None,
+            session_name: session.session_name.clone(),
+            agent_type: agent_type.clone(),
+            logical_agent_type: session.agent_type.clone(),
+            session_config: session.config.clone(),
+            initial_messages: vec![Message::user(task_description.clone())],
+            user_input_text: task_description,
+            created_by: session.created_by.clone(),
+            subagent_parent_info: Some(subagent_parent_info),
+            context: HashMap::new(),
+            permission_runtime_ceiling: None,
+            delegation_policy,
+            runtime_tool_restrictions: runtime_tool_restrictions_for_session_lifetime(
+                runtime_tool_restrictions_for_delegation_policy(delegation_policy),
+                transient,
+            ),
+            prompt_cache_source_session_id: None,
+            session_kind: SessionKind::Subagent,
+            transient,
+            emit_lifecycle_events: true,
+            prepared_session_created: false,
+            execution_lease: None,
+            external_generation_lease: None,
+        };
+        self.execute_hidden_subagent_internal(hidden_request, cancel_token, timeout_seconds)
+            .await
     }
 
     /// Execute a hidden internal agent without requiring a parent Task/session.
@@ -10652,6 +10834,25 @@ Update the persona files and delete BOOTSTRAP.md as soon as bootstrap is complet
     /// Get SessionManager reference (for advanced features like mode management)
     pub fn get_session_manager(&self) -> &Arc<SessionManager> {
         &self.session_manager
+    }
+
+    /// Get a subagent instance by ID.
+    pub(crate) fn get_subagent_instance(&self, instance_id: &str) -> Option<SubagentInstance> {
+        self.subagent_instances.get(instance_id)
+    }
+
+    /// Clean up all subagent instances for a parent session.
+    /// Should be called when the parent session ends or is deleted.
+    pub(crate) fn cleanup_subagent_instances_for_session(&self, parent_session_id: &str) {
+        let destroyed_count = self
+            .subagent_instances
+            .destroy_all_for_parent(parent_session_id);
+        if destroyed_count > 0 {
+            info!(
+                "Cleaning up subagent instances for parent session: parent_session_id={}, destroyed_count={}",
+                parent_session_id, destroyed_count
+            );
+        }
     }
 
     /// Set global coordinator (called during initialization)
@@ -12716,6 +12917,7 @@ fn merge_prepended_messages_for_turn(
 
 #[cfg(test)]
 mod tests {
+    use super::super::subagent_instance::SubagentInstanceStatus;
     use super::{
         apply_primary_agent_model_default, btw_session_memory_mode,
         build_subagent_session_relationship, lineage_active_turn_after_transcript,
@@ -12731,7 +12933,7 @@ mod tests {
         ActiveSubagentExecution, BackgroundSubagentWaitMode, ContextCompactionOutcome,
         ConversationCoordinator, ManualCompactionCommitGate, SessionMemoryMode,
         SessionReferenceLocator, SessionRelationshipKind, SubagentExecutionRequest,
-        TEST_AGENT_MODEL_DEFAULTS,
+        SubagentInstance, TEST_AGENT_MODEL_DEFAULTS,
     };
     use crate::agentic::agents::ExternalSubagentModelBinding;
     use crate::agentic::coordination::coordination_store::{
@@ -15410,6 +15612,192 @@ mod tests {
                 .expect("resolve caller-named agent"),
             "reviewer-session"
         );
+    }
+
+    #[test]
+    fn subagent_result_defaults_instance_id_to_none() {
+        let completed = super::SubagentResult::completed("done".to_string());
+        assert!(completed.instance_id.is_none());
+
+        let timed_out =
+            super::SubagentResult::partial_timeout("partial".to_string(), "timeout".to_string());
+        assert!(timed_out.instance_id.is_none());
+
+        let with_instance = completed.with_instance_id("subagent-instance-1".to_string());
+        assert_eq!(
+            with_instance.instance_id.as_deref(),
+            Some("subagent-instance-1")
+        );
+    }
+
+    #[tokio::test]
+    async fn get_subagent_instance_returns_registered_instance() {
+        let (coordinator, _) = test_coordinator();
+        let instance = SubagentInstance::new(
+            SubagentInstance::generate_instance_id(),
+            "parent-1".to_string(),
+            "child-1".to_string(),
+            "general".to_string(),
+        );
+        let instance_id = instance.instance_id.clone();
+        coordinator.subagent_instances.register(instance);
+
+        let fetched = coordinator
+            .get_subagent_instance(&instance_id)
+            .expect("registered instance should be readable");
+        assert_eq!(fetched.parent_session_id, "parent-1");
+        assert_eq!(fetched.child_session_id, "child-1");
+        assert_eq!(fetched.agent_type, "general");
+        assert!(coordinator
+            .get_subagent_instance("missing-instance")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn resume_subagent_rejects_unknown_instance() {
+        let (coordinator, _) = test_coordinator();
+        let error = coordinator
+            .resume_subagent(
+                "missing-instance",
+                "continue".to_string(),
+                SubagentParentInfo {
+                    tool_call_id: "tool-1".to_string(),
+                    session_id: "parent-1".to_string(),
+                    dialog_turn_id: "turn-1".to_string(),
+                },
+                None,
+                None,
+            )
+            .await
+            .expect_err("unknown instance must be rejected");
+        assert!(
+            error.to_string().contains("not found"),
+            "unexpected error: {}",
+            error
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_subagent_rejects_running_instance() {
+        let (coordinator, _) = test_coordinator();
+        let instance = SubagentInstance::new(
+            SubagentInstance::generate_instance_id(),
+            "parent-1".to_string(),
+            "child-1".to_string(),
+            "general".to_string(),
+        );
+        let instance_id = instance.instance_id.clone();
+        coordinator.subagent_instances.register(instance);
+
+        let error = coordinator
+            .resume_subagent(
+                &instance_id,
+                "continue".to_string(),
+                SubagentParentInfo {
+                    tool_call_id: "tool-1".to_string(),
+                    session_id: "parent-1".to_string(),
+                    dialog_turn_id: "turn-1".to_string(),
+                },
+                None,
+                None,
+            )
+            .await
+            .expect_err("Running instance must not be resumable");
+        assert!(
+            error.to_string().contains("not idle"),
+            "unexpected error: {}",
+            error
+        );
+        assert_eq!(
+            coordinator
+                .get_subagent_instance(&instance_id)
+                .unwrap()
+                .status,
+            SubagentInstanceStatus::Running
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_subagent_returns_instance_to_idle_after_failure() {
+        let (coordinator, _) = test_coordinator();
+        // The instance points at a child session that does not exist; the
+        // resumed execution fails, but the instance must return to Idle so a
+        // later resume is still possible.
+        let instance = SubagentInstance::new(
+            SubagentInstance::generate_instance_id(),
+            "parent-1".to_string(),
+            "missing-child-session".to_string(),
+            "general".to_string(),
+        );
+        let instance_id = instance.instance_id.clone();
+        coordinator.subagent_instances.register(instance);
+        coordinator
+            .subagent_instances
+            .set_idle(&instance_id)
+            .expect("instance should become Idle");
+
+        let error = coordinator
+            .resume_subagent(
+                &instance_id,
+                "continue".to_string(),
+                SubagentParentInfo {
+                    tool_call_id: "tool-1".to_string(),
+                    session_id: "parent-1".to_string(),
+                    dialog_turn_id: "turn-1".to_string(),
+                },
+                None,
+                None,
+            )
+            .await
+            .expect_err("missing child session must fail the resume");
+        assert!(
+            error.to_string().contains("not found"),
+            "unexpected error: {}",
+            error
+        );
+        let fetched = coordinator
+            .get_subagent_instance(&instance_id)
+            .expect("instance should still exist");
+        assert_eq!(fetched.status, SubagentInstanceStatus::Idle);
+        assert!(fetched.can_resume());
+    }
+
+    #[tokio::test]
+    async fn cleanup_subagent_instances_for_session_destroys_matching_instances() {
+        let (coordinator, _) = test_coordinator();
+        let instance_a = SubagentInstance::new(
+            SubagentInstance::generate_instance_id(),
+            "parent-a".to_string(),
+            "child-a".to_string(),
+            "general".to_string(),
+        );
+        let instance_b = SubagentInstance::new(
+            SubagentInstance::generate_instance_id(),
+            "parent-a".to_string(),
+            "child-b".to_string(),
+            "general".to_string(),
+        );
+        let instance_c = SubagentInstance::new(
+            SubagentInstance::generate_instance_id(),
+            "parent-b".to_string(),
+            "child-c".to_string(),
+            "general".to_string(),
+        );
+        let id_a = instance_a.instance_id.clone();
+        let id_b = instance_b.instance_id.clone();
+        let id_c = instance_c.instance_id.clone();
+        coordinator.subagent_instances.register(instance_a);
+        coordinator.subagent_instances.register(instance_b);
+        coordinator.subagent_instances.register(instance_c);
+
+        coordinator.cleanup_subagent_instances_for_session("parent-a");
+
+        assert!(coordinator.get_subagent_instance(&id_a).is_none());
+        assert!(coordinator.get_subagent_instance(&id_b).is_none());
+        let remaining = coordinator
+            .get_subagent_instance(&id_c)
+            .expect("other parent's instance survives");
+        assert_eq!(remaining.parent_session_id, "parent-b");
     }
 
     #[tokio::test]

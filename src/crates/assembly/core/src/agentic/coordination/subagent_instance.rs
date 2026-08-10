@@ -26,6 +26,10 @@ pub(crate) enum SubagentInstanceStatus {
     /// Between Tasks. Session is persisted, context retained.
     Idle,
     /// Explicitly destroyed or parent session ended.
+    /// Reserved for soft-delete / history scenarios in later phases; the
+    /// current registry implements hard-delete semantics and never returns
+    /// this variant from lookups.
+    #[allow(dead_code, reason = "reserved for Phase 3 soft-delete scenarios")]
     Destroyed,
 }
 
@@ -52,6 +56,7 @@ pub(crate) struct SubagentInstance {
     pub status: SubagentInstanceStatus,
 
     /// When the instance was first created (unix epoch millis).
+    #[allow(dead_code, reason = "consumed by later-phase history reporting")]
     pub created_at: u64,
 
     /// Last time a Task completed on this instance (unix epoch millis).
@@ -183,6 +188,7 @@ impl SubagentInstanceRegistry {
 
     /// Destroy a single instance. Logs at info level. Hard delete: the entry
     /// is removed from the registry (see `SubagentInstanceStatus`).
+    #[allow(dead_code, reason = "consumed by later-phase per-instance cleanup")]
     pub(crate) fn destroy(&self, instance_id: &str, reason: &str) {
         if let Some((_, instance)) = self.instances.remove(instance_id) {
             info!(
@@ -213,6 +219,7 @@ impl SubagentInstanceRegistry {
     }
 
     /// List all instance IDs for a given parent session.
+    #[allow(dead_code, reason = "consumed by later-phase session inspection")]
     pub(crate) fn list_for_parent(&self, parent_session_id: &str) -> Vec<String> {
         self.instances
             .iter()
@@ -222,6 +229,7 @@ impl SubagentInstanceRegistry {
     }
 
     /// Number of active (non-destroyed) instances.
+    #[allow(dead_code, reason = "consumed by later-phase diagnostics")]
     pub(crate) fn active_count(&self) -> usize {
         self.instances.len()
     }
